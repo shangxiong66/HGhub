@@ -465,9 +465,29 @@ pub async fn api_video(state: State<'_, Api>, id: i64) -> Result<Value, String> 
 
 #[tauri::command]
 pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
-    state
-        .get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0"))
-        .await
+    let origin = base();
+    let token = state.session.token(&origin);
+    // 2026-11-09 上游升级：播放地址只从 dx150-edge-v1 加密网关下发（见 edge_crypto.rs），
+    // 新端点为 POST /api/videos/:id/episodes/:ep/playback。
+    let path = format!("/api/videos/{id}/episodes/{ep}/playback");
+    match crate::edge_crypto::playback_request(&origin, "POST", &path, token.as_deref()).await {
+        Ok(response) => Ok(crate::edge_crypto::map_play_response(response)),
+        Err(gateway_error) => {
+            // 兜底：未升级的镜像线路可能仍提供旧端点；官方线路旧端点只返回空地址。
+            crate::playback_log::record(
+                "playback.gateway_fallback",
+                json!({"error_kind": crate::playback_log::error_kind(&gateway_error)}),
+            );
+            crate::net::edge(
+                &origin,
+                "GET",
+                &format!("/api/videos/{id}/play?ep={ep}&page_texts=0"),
+                None,
+                token.as_deref(),
+            )
+            .await
+        }
+    }
 }
 
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */

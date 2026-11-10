@@ -4,7 +4,7 @@
 //! 所以图片与视频统一走本地自定义协议（Windows/Android 为 `http://hg.localhost`，
 //! macOS 为 `hg://localhost`，见 [`LOCAL_ORIGIN`]）。
 
-use crate::net::fetch_bytes;
+use crate::net::{fetch_bytes, fetch_bytes_with_headers};
 use aes::cipher::{BlockDecrypt, KeyInit};
 use aes::Aes128;
 use once_cell::sync::Lazy;
@@ -197,7 +197,8 @@ pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, Strin
     if let Some(hit) = PL_CACHE.lock().unwrap().get(&cache_key).cloned() {
         return Ok(hit);
     }
-    let (_, bytes) = fetch_bytes(url).await?;
+    // 新版 CDN 签名：m3u8 可能需要带 x-cdn-auth / x-cdn-app（见 edge_crypto::cdn_headers_for）。
+    let (_, bytes) = fetch_bytes_with_headers(url, &crate::edge_crypto::cdn_headers_for(url)).await?;
     let text = std::str::from_utf8(&bytes).map_err(|_| "播放列表不是 UTF-8 文本")?;
     if !text.trim_start_matches('\u{feff}').starts_with("#EXTM3U") {
         return Err("响应不是 HLS 播放列表".into());
@@ -267,7 +268,8 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
     if let Some((ctype, hit)) = SEG_CACHE.lock().unwrap().get(url).cloned() {
         return Ok((Some(ctype), hit));
     }
-    let (ctype, bytes) = fetch_bytes(url).await?;
+    let (ctype, bytes) =
+        fetch_bytes_with_headers(url, &crate::edge_crypto::cdn_headers_for(url)).await?;
     let mime = ctype.clone().unwrap_or_else(|| {
         let p = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
         if p.ends_with(".ts") {
@@ -465,20 +467,19 @@ mod tests {
     }
 
     /// 联网测试：默认跳过，手动跑 `cargo test --lib -- --ignored`。
-    /// 依赖上游 `/api/videos/117/play` 返回的实时播放地址。
+    /// 依赖上游加密网关返回的实时播放地址。
     #[tokio::test]
     #[ignore = "联网测试：依赖上游实时播放地址，手动用 --ignored 运行"]
     async fn live_play_chain() {
-        use crate::net::edge;
-        let play = edge(
+        let play = crate::edge_crypto::playback_request(
             &crate::net::base(),
-            "GET",
-            "/api/videos/117/play?ep=3&page_texts=0",
-            None,
+            "POST",
+            "/api/videos/117/episodes/3/playback",
             None,
         )
         .await
         .expect("play api");
+        let play = crate::edge_crypto::map_play_response(play);
         let url = play["video_url"].as_str().expect("video_url").to_string();
         println!("play url: {}", &url[..url.len().min(90)]);
         let (_, bytes) = fetch_bytes(&url).await.expect("fetch playlist");

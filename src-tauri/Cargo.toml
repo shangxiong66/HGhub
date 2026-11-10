@@ -37,6 +37,13 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
 aes = "0.8"
+# dx150-edge-v1 加密网关（2026-11 上游升级）：播放地址必须走 ECDH 握手 + AES-GCM 信封，
+# 见 src/edge_crypto.rs 与官网 /static/web/js/edge-api-crypto.js。
+p256 = { version = "0.13", features = ["ecdh"] }
+hkdf = "0.12"
+sha2 = "0.10"
+aes-gcm = "0.10"
+rand = "0.8"
 base64 = "0.22"
 percent-encoding = "2"
 once_cell = "1"

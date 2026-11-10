@@ -161,8 +161,7 @@ fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<req
 
 /// 缓存按模式、主机和端口隔离；有效期内仅复用已经检查并固定地址的客户端。
 /// 到期后重新检查全部 DNS 答案，不使用旧连接绕过新的目标检查。
-async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), String> {
-    let strict = network_policy::strict_security();
+pub(crate) async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), String> {    let strict = network_policy::strict_security();
     let target = network_policy::parse_target_with_mode(raw, strict)?;
     let host = target.host_str().ok_or("目标缺少主机名")?;
     let port = target.port_or_known_default().ok_or("目标端口无效")?;
@@ -206,6 +205,17 @@ pub async fn get(
     accept: Option<&str>,
     referer: Option<&str>,
 ) -> Result<reqwest::Response, String> {
+    get_with(raw, timeout, accept, referer, &[]).await
+}
+
+/// 同 [`get`]，但允许附加请求头（新版 CDN 分片需要 `x-cdn-auth` / `x-cdn-app`）。
+pub async fn get_with(
+    raw: &str,
+    timeout: Duration,
+    accept: Option<&str>,
+    referer: Option<&str>,
+    extra: &[(String, String)],
+) -> Result<reqwest::Response, String> {
     tokio::time::timeout(timeout, async {
         let policy_error = |phase: &str, error: String| {
             crate::playback_log::record("network.target_failed", json!({"resource": crate::playback_log::resource_id(raw), "phase": phase, "error_kind": crate::playback_log::error_kind(&error)}));
@@ -223,6 +233,9 @@ pub async fn get(
             if let Some(value) = referer {
                 request = request.header("Referer", value);
             }
+            for (key, value) in extra {
+                request = request.header(key.as_str(), value.as_str());
+            }
             let response = request.send().await.map_err(|e| err_text(&e))?;
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 return Ok(response);
@@ -239,6 +252,32 @@ pub async fn get(
             crate::playback_log::record("network.redirect", json!({"resource": crate::playback_log::resource_id(raw), "from": crate::playback_log::resource_id(target.as_str()), "to": crate::playback_log::resource_id(next.as_str()), "status": response.status().as_u16(), "hop": hop + 1}));
         }
         Err("重定向次数超过限制".into())
+    })
+    .await
+    .map_err(|_| "请求超时".to_string())?
+}
+
+/// JSON POST（仅供加密网关握手/调用使用）；不跟随重定向，返回状态码与解析后的 JSON。
+pub(crate) async fn post_json(
+    raw: &str,
+    body: &Value,
+    timeout: Duration,
+) -> Result<(u16, Value), String> {
+    tokio::time::timeout(timeout, async {
+        let (target, http) = client_for(raw).await?;
+        let referer = format!("{}/", base());
+        let resp = http
+            .post(target)
+            .header("Accept", "application/json")
+            .header("Referer", referer)
+            .json(body)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| err_text(&e))?;
+        let status = resp.status().as_u16();
+        let value: Value = resp.json().await.map_err(|e| err_text(&e))?;
+        Ok((status, value))
     })
     .await
     .map_err(|_| "请求超时".to_string())?
@@ -613,25 +652,35 @@ pub async fn edge(
 
 /// 拉原始字节（图片 / m3u8 / 分片）。
 pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String> {
+    fetch_bytes_with_headers(url, &[]).await
+}
+
+/// 同 [`fetch_bytes`]，但可附加请求头（新版 CDN 分片认证）。
+pub async fn fetch_bytes_with_headers(
+    url: &str,
+    extra: &[(String, String)],
+) -> Result<(Option<String>, Vec<u8>), String> {
     static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let request = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let resource = crate::playback_log::resource_id(url);
     let mut attempt = 0;
     let url = url.to_string();
     let referer = format!("{}/", base());
+    let extra: Vec<(String, String)> = extra.to_vec();
     with_retry(true, || {
         attempt += 1;
         let attempt = attempt;
         let resource = resource.clone();
         let url = url.clone();
         let referer = referer.clone();
+        let extra = extra.clone();
         async move {
             let started = Instant::now();
             crate::playback_log::record("network.begin", json!({"request": request, "resource": resource, "attempt": attempt}));
             let mut status = None;
             let mut headers_ms = None;
             let result = async {
-                let resp = get(&url, Duration::from_secs(20), None, Some(&referer)).await?;
+                let resp = get_with(&url, Duration::from_secs(20), None, Some(&referer), &extra).await?;
                 status = Some(resp.status().as_u16());
                 headers_ms = Some(started.elapsed().as_millis() as u64);
                 if !resp.status().is_success() {
